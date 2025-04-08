@@ -7,7 +7,6 @@ sdcard/*
 # Kernel files
 *.elf
 *.hex
-*.img
 *.lst
 *.map
 
