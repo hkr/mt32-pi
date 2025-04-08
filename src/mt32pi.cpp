@@ -27,6 +27,7 @@
 #include <circle/sound/pwmsoundbasedevice.h>
 
 #include <cstdarg>
+#include <math.h>
 
 #include "lcd/drivers/hd44780.h"
 #include "lcd/drivers/ssd1306.h"
@@ -54,6 +55,16 @@ enum class TCustomSysExCommand : u8
 	SwitchSoundFont       = 0x02,
 	SwitchSynth           = 0x03,
 	SetMT32ReversedStereo = 0x04,
+
+	// midiori-synth
+	FMVolume = 0x30,
+	PIVolume,
+	WTVolume,
+	ExtOutVolume,
+	IntOutVolume,
+	WTChannelSwap,
+	SynthSelect,
+	SynthVolume
 };
 
 CMT32Pi* CMT32Pi::s_pThis = nullptr;
@@ -433,6 +444,8 @@ void CMT32Pi::MainTask()
 		// Process events
 		ProcessEventQueue();
 
+		ProcessMidioriSynthQueue();
+
 		const unsigned int nTicks = m_pTimer->GetTicks();
 
 		// Update activity LED
@@ -497,6 +510,169 @@ void CMT32Pi::MainTask()
 	while (!m_bUITaskDone)
 		;
 }
+
+struct DSPValue
+{
+	u8 value[4];
+};
+
+struct DSPRegister
+{
+	DSPRegister() {}
+	DSPRegister(u16 v)
+	{
+
+		value[0] = v >> 8;
+		value[1] = v & 0xff;
+	}
+	u8 value[2];
+};
+
+static DSPValue s32_to_dsp(s32 val)
+{
+    u8 sign = val < 0 ? (1 << 3) : 0;
+	return { u8(((val >> 24) & 0x07) | sign), u8((val >> 16) & 0xff), u8((val >> 8) & 0xff), u8(val & 0xff) };
+}
+
+#if 0
+static DSPValue float_to_dsp(float x)
+{
+    if (x >= 16.0f)
+        x = 15.999999f;
+    else if (x < -16.0f)
+        x = -16.0f;
+
+    return s32_to_dsp((s32)roundf(x * (1 << 23))); 
+}
+#endif
+
+static DSPValue u8_unorm_to_dsp(u8 v, u8 s = 0) // s=1 -> [0.0-1.0], s=1 -> [0.0-2.0]
+{
+    return s32_to_dsp((s32)(((1u<<(23 + s)) * v + 127u) / 255u)); 
+}
+
+const u8 MS_DspAddr = 0x34; // 7bit
+const u8 MS_IFCW_bit = 1<<6; // interface regmwrite enabe
+const u8 MS_IST_bit = 1<<5; // initiate safe transfer
+#define MS_DSP_CTRL_MSG(bit) { 0x08, 0x1C, 0, u8(0x1e | bit) };
+
+static bool MidioriSynthWriteIFRegister(CI2CMaster& i2cMaster, u8 ifRegIndex, u8 value)
+{
+	u8 SetIFCW[] = MS_DSP_CTRL_MSG(MS_IFCW_bit);
+	if (i2cMaster.Write(MS_DspAddr, SetIFCW, sizeof(SetIFCW)) < 0)
+		return false;
+
+	u8 IfRegWrite[] = { 0x08, ifRegIndex, 0, 0, 0, value };
+	if (i2cMaster.Write(MS_DspAddr, IfRegWrite, sizeof(IfRegWrite)) < 0)
+		return false;
+
+	u8 ResetIFCW[] = MS_DSP_CTRL_MSG(0);
+	if (i2cMaster.Write(MS_DspAddr, ResetIFCW, sizeof(ResetIFCW)) < 0)
+		return false;
+
+	return true;
+}
+
+static bool MidioriSynthWriteParamRegister(CI2CMaster& i2cMaster, const DSPRegister* reg, const DSPValue* val, u8 count)
+{
+	if (count > 5 || count == 0)
+		return false;
+
+	for (u8 i = 0; i < count; ++i)
+	{
+		u8 SetSafeLoadData[] = { 0x08, u8(0x10 + i), 0, val[i].value[0], val[i].value[1], val[i].value[2], val[i].value[3] };
+		if (i2cMaster.Write(MS_DspAddr, SetSafeLoadData, sizeof(SetSafeLoadData)) < 0)
+			return false;
+
+		u8 SetSafeLoadAddr[4] = { 0x08, u8(0x15 + i), reg[i].value[0], reg[i].value[1] };
+		if (i2cMaster.Write(MS_DspAddr, SetSafeLoadAddr, sizeof(SetSafeLoadAddr)) < 0)
+			return false;
+	}
+
+	u8 SetIST[] = MS_DSP_CTRL_MSG(MS_IST_bit);
+	if (i2cMaster.Write(MS_DspAddr, SetIST, sizeof(SetIST)) < 0)
+		return false;
+
+	return true;
+}
+
+void CMT32Pi::ProcessMidioriSynthQueue()
+{
+	const u32 Tick = CTimer::GetClockTicks();
+
+#if 0
+	static u32 s_LastDebugUpdate;
+	if (Tick - s_LastDebugUpdate > 5000000)
+	{
+		s_LastDebugUpdate = Tick;
+		static bool last;
+		m_MidioriControlBuffer.Enqueue((static_cast<u32>(TCustomSysExCommand::ExtOutVolume) << 24) | static_cast<u32>(!last ? 128 : 0) |  (static_cast<u32>(last ? 128 : 0) << 8));
+		last = !last;
+		LOGWARN("debug command");
+	}
+#endif
+
+	static u32 s_LastSafeParamUpdateTick;
+	// safe parameter updates happen with every sample, at 48kHz 100 ticks (0.1ms) is plenty
+	if (Tick - s_LastSafeParamUpdateTick > 100)
+	{
+		const int MaxSafeParamTransfers = 5;
+		DSPValue dspValues[MaxSafeParamTransfers];
+		DSPRegister dspRegisters[MaxSafeParamTransfers];
+		u8 dspParamCount = 0;
+
+		while (dspParamCount + 1 < MaxSafeParamTransfers)
+		{
+			u32 msg = 0;
+			if (!m_MidioriControlBuffer.Dequeue(msg))
+				break;
+
+			const int cmd = msg >> 24;
+			const u8 param[2] = { u8(msg & 0xff), u8((msg >> 8) & 0xff) };
+			const u8 BaseParamRegisterMap[] = {2, 6, 4, 48, 46};
+
+			switch(static_cast<TCustomSysExCommand>(cmd))
+			{
+			default: 
+				LOGWARN("Midiori Synth Control: Unexpected command %d", (int)cmd);
+				break;
+			case TCustomSysExCommand::FMVolume:
+			case TCustomSysExCommand::WTVolume:
+			case TCustomSysExCommand::PIVolume:
+			case TCustomSysExCommand::IntOutVolume:
+			case TCustomSysExCommand::ExtOutVolume:
+			{
+				const u8 baseReg = BaseParamRegisterMap[cmd - int(TCustomSysExCommand::FMVolume)];
+				for (int i = 0; i < 2; ++i)
+				{
+					dspValues[dspParamCount] = u8_unorm_to_dsp(param[i], 1);
+					dspRegisters[dspParamCount++] = DSPRegister(baseReg + i);
+				}
+				break;
+			}
+			case TCustomSysExCommand::WTChannelSwap:
+				dspRegisters[dspParamCount] = DSPRegister(41);
+				dspValues[dspParamCount++] = s32_to_dsp(param[0] ? 0 : (1<<23));
+				dspRegisters[dspParamCount] = DSPRegister(42);
+				dspValues[dspParamCount++] = s32_to_dsp(!param[0] ? 0 : (1<<23));
+				break;
+			case TCustomSysExCommand::SynthVolume:
+				MidioriSynthWriteIFRegister(*m_pI2CMaster, 1, (255 - param[0]) >> 3);
+				break;
+			case TCustomSysExCommand::SynthSelect:
+				MidioriSynthWriteIFRegister(*m_pI2CMaster, 0, param[0] ? 1 : 0);
+				break;
+			}
+		}
+
+		if (dspParamCount > 0)
+		{
+			if (MidioriSynthWriteParamRegister(*m_pI2CMaster, dspRegisters, dspValues, dspParamCount))
+				s_LastSafeParamUpdateTick = Tick;
+		}
+	}
+}
+
 
 void CMT32Pi::UITask()
 {
@@ -730,7 +906,7 @@ bool CMT32Pi::ParseCustomSysEx(const u8* pData, size_t nSize)
 		return true;
 	}
 
-	if (nSize != 5)
+	if (nSize != 5 && Command < TCustomSysExCommand::FMVolume)
 		return false;
 
 	const u8 nParameter = pData[3];
@@ -762,6 +938,28 @@ bool CMT32Pi::ParseCustomSysEx(const u8* pData, size_t nSize)
 		{
 			if (m_pMT32Synth)
 				m_pMT32Synth->SetReversedStereo(nParameter);
+			return true;
+		}
+
+		// midiori-synth
+		case TCustomSysExCommand::FMVolume:
+		case TCustomSysExCommand::PIVolume:
+		case TCustomSysExCommand::WTVolume:
+		case TCustomSysExCommand::IntOutVolume:
+		case TCustomSysExCommand::ExtOutVolume:
+		{
+			if (nSize != 6)
+				return false;
+			m_MidioriControlBuffer.Enqueue((static_cast<u32>(Command) << 24) | static_cast<u32>(nParameter) | (static_cast<u32>(pData[4]) << 8));
+			return true;
+		}
+		case TCustomSysExCommand::WTChannelSwap:
+		case TCustomSysExCommand::SynthSelect:
+		case TCustomSysExCommand::SynthVolume:
+		{
+			if (nSize != 5)
+				return false;
+			m_MidioriControlBuffer.Enqueue((static_cast<u32>(Command) << 24) | static_cast<u32>(nParameter));
 			return true;
 		}
 

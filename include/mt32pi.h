@@ -127,6 +127,7 @@ private:
 
 	void ProcessEventQueue();
 	void ProcessButtonEvent(const TButtonEvent& Event);
+	void ProcessMidioriSynthQueue();
 
 	// Actions that can be triggered via events
 	void SwitchSynth(TSynth Synth);
@@ -218,6 +219,9 @@ private:
 
 	// Event handling
 	TEventQueue m_EventQueue;
+
+	// Midiori-Synth Mixer Control
+	CRingBuffer<u32, 16> m_MidioriControlBuffer;
 
 	static void EventHandler(const TEvent& Event);
 	static void USBMIDIDeviceRemovedHandler(CDevice* pDevice, void* pContext);
